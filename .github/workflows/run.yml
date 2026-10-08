@@ -1,0 +1,40 @@
+name: Run Bot
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run once
+        env:
+          TON_MNEMONIC: ${{ secrets.TON_MNEMONIC }}
+          TONCENTER_API_KEY: ${{ secrets.TONCENTER_API_KEY }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          STARTING_CAPITAL: ${{ secrets.STARTING_CAPITAL }}
+          MAX_TON_PER_TRADE: ${{ secrets.MAX_TON_PER_TRADE }}
+          MIN_TON_RESERVE: ${{ secrets.MIN_TON_RESERVE }}
+          MAX_DAILY_LOSS_PCT: ${{ secrets.MAX_DAILY_LOSS_PCT }}
+          MAX_OPEN_POSITIONS: ${{ secrets.MAX_OPEN_POSITIONS }}
+          MIN_SCORE_TO_BUY: ${{ secrets.MIN_SCORE_TO_BUY }}
+          CHECK_INTERVAL: ${{ secrets.CHECK_INTERVAL }}
+        run: python run_once.py
+      - name: Commit state
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update state"
+          git push
