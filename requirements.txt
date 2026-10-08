@@ -1,4 +1,4 @@
 python-dotenv
 httpx
 tonsdk
-dedust
+git+https://github.com/dedust-io/sdk-py.git
