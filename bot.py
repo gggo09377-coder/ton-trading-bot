@@ -7,9 +7,9 @@ from datetime import datetime
 from dotenv import load_dotenv
 from tonsdk.contract.wallet import Wallets, WalletVersionEnum
 from tonsdk.utils import Address, bytes_to_b64str
-from dedust import Asset, Factory, PoolType, SwapParams, VaultJetton, VaultNative
-from dedust.api import Provider
+from dedust import Asset, Factory, PoolType, SwapParams, VaultJetton, VaultNative, Provider
 import httpx
+
 
 load_dotenv()
 
