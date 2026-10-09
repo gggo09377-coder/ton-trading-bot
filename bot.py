@@ -13,17 +13,13 @@ CHAT_ID = os.getenv("CHAT_ID", "")
 STATE_FILE = "state.json"
 CONFIRM_TIMEOUT = 1800
 
+# العناوين اللي أرسلتها
 TOKENS = {
-    "XROCK": "EQ...",
-    "STORM": "EQ...",
-    "UTYA": "EQ...",
-    "LAMBO": "EQ...",
-    "TAC": "EQ...",
-    "GRAM": "EQ...",
-    "STON": "EQ...",
-    "NOT": "EQ...",
-    "cbBTC": "EQ...",
-    "WETH": "EQ...",
+    "USDT": "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs",
+    "NOT":  "EQAvlWFDxGF2lXm67y4yzC17wYKD9A0guwPkMs1gOsM__NOT",
+    "DOGS": "EQCvxJy4eG8hyHBFsZ7eePxrRsUQSFE_jpptRAYBmcG_DOGS",
+    "STON": "EQA2kCVNwVsil2EM2mB0SkXytxCqQjS4mttjDpnXmwG9T6bO",
+    "GRAM": "EQC47093oX5Xhb0xuk2lCr2RhS8rj-vul61u4W2UH5ORmG_O",
 }
 
 DEFAULT_STATE = {
@@ -129,7 +125,6 @@ def score(prices):
 async def scan_all(state):
     best = None
     for sym, addr in TOKENS.items():
-        if addr == "EQ...": continue
         md = await get_price(addr)
         if not md or md["price"] == 0: continue
         if sym not in state["price_history"]: state["price_history"][sym] = []
@@ -145,7 +140,7 @@ async def scan_all(state):
 async def check_current(state):
     sym = state["current_symbol"]
     addr = TOKENS.get(sym, "")
-    if not addr or addr == "EQ...": return None
+    if not addr: return None
     md = await get_price(addr)
     if not md: return None
     prices = [h["price"] for h in state["price_history"].get(sym, [])]
