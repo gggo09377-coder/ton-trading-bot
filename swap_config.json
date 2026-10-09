@@ -1,0 +1,11 @@
+{
+  "from_token_address": "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c",
+  "from_token_decimals": 9,
+  "to_token_address": "EQAvlWFDxGF2lXm67y4yzC17wYKD9A0guwPkMs1gOsM__NOT",
+  "to_token_decimals": 9,
+  "amount": "0.5",
+  "max_slippage_bps": 500,
+  "max_outgoing_messages": 4,
+  "gasless_mode": "GASLESS_SETTLEMENT_POSSIBLE",
+  "flexible_referrer_fee": false
+}
