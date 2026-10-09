@@ -1,12 +1,12 @@
 {
-  "phase": "waiting_confirmation",
+  "phase": "holding",
   "current_symbol": "USDT",
-  "entry_price": 0.0,
-  "target_price": 0.0,
-  "stop_price": 0.0,
+  "entry_price": 1.0043,
+  "target_price": 1.255375,
+  "stop_price": 0.90387,
   "sell_price": 0.0,
   "signal_sent_at": 1791571210.4231844,
-  "last_update_id": 442365823,
+  "last_update_id": 442365824,
   "price_history": {
     "USDT": [
       {
