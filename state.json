@@ -1,6 +1,6 @@
 {
-  "phase": "waiting_confirmation",
-  "current_symbol": "GRAM",
+  "phase": "hunting",
+  "current_symbol": null,
   "entry_price": 0,
   "target_price": 1.255375,
   "stop_price": 0.90387,
