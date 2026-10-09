@@ -7,7 +7,38 @@
   "sell_price": 0.0,
   "signal_sent_at": 0,
   "last_update_id": 0,
-  "price_history": {},
+  "price_history": {
+    "USDT": [
+      {
+        "t": 1791548663.107005,
+        "price": 1.003
+      }
+    ],
+    "NOT": [
+      {
+        "t": 1791548663.2207792,
+        "price": 0.0004487
+      }
+    ],
+    "DOGS": [
+      {
+        "t": 1791548663.5480673,
+        "price": 4.243e-05
+      }
+    ],
+    "STON": [
+      {
+        "t": 1791548663.6790023,
+        "price": 0.567
+      }
+    ],
+    "GRAM": [
+      {
+        "t": 1791548663.7878947,
+        "price": 0.0006976
+      }
+    ]
+  },
   "trades": [],
   "last_daily_report": ""
 }
