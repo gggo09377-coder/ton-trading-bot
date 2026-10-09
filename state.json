@@ -1,0 +1,13 @@
+{
+  "phase": "hunting",
+  "current_symbol": null,
+  "entry_price": 0.0,
+  "target_price": 0.0,
+  "stop_price": 0.0,
+  "sell_price": 0.0,
+  "signal_sent_at": 0,
+  "last_update_id": 0,
+  "price_history": {},
+  "trades": [],
+  "last_daily_report": ""
+}
