@@ -1,4 +1,3 @@
-بس حطلياهن كلهن علمود بس ادوس نسخ
 import asyncio
 import base64
 import json
