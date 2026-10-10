@@ -1,4 +1,2 @@
 python-dotenv
 httpx
-tonsdk
-websockets
