@@ -4,11 +4,9 @@ import json
 import os
 import time
 import uuid
-from decimal import Decimal
 from datetime import datetime
 from dotenv import load_dotenv
 from tonsdk.contract.wallet import Wallets, WalletVersionEnum
-from tonsdk.boc import Cell
 import httpx
 import websockets
 
@@ -23,7 +21,7 @@ TONCENTER_API_URL = "https://toncenter.com/api/v2"
 TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "")
 OMNISTON_WS_URL = "wss://omni-ws.ston.fi"
 TON_MNEMONIC = os.getenv("TON_MNEMONIC", "").split()
-DRY_RUN = os.getenv("DRY_RUN", "1") == "1"  # 1 = اختبار، 0 = حقيقي
+DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 
 STATE_FILE = "state.json"
 BLOCKCHAIN_ID = 607
@@ -295,15 +293,13 @@ async def scan(state):
     return best
 
 # ═══════════════════════════════════════
-#   Omniston Test
+#   Omniston
 # ═══════════════════════════════════════
-async def test_omni_connection():
-    """اختبار الاتصال بـ Omniston بدون أي معاملة"""
+async def get_full_quote():
     try:
         async with websockets.connect(
             OMNISTON_WS_URL, ping_interval=20, ping_timeout=20
         ) as ws:
-            # جربنا نرسل ping بسيط
             request_id = str(uuid.uuid4())
             payload = {
                 "jsonrpc": "2.0",
@@ -318,7 +314,7 @@ async def test_omni_connection():
                         "blockchain": BLOCKCHAIN_ID,
                         "address": TOKENS["NOT"]["addr"],
                     },
-                    "amount": {"bid_units": "100000000"},  # 0.1 TON
+                    "amount": {"bid_units": "100000000"},
                     "referrer_fee_bps": 0,
                     "settlement_methods": [0],
                 },
@@ -332,14 +328,115 @@ async def test_omni_connection():
                     )
                     data = json.loads(raw)
                     if data.get("error"):
-                        return f"❌ Omniston error: {str(data['error'])[:100]}"
+                        return {"error": str(data["error"])[:200]}
                     if data.get("result"):
-                        return f"✅ Omniston اشتغل! الرد: {str(data['result'])[:80]}"
+                        return {"quote": data["result"]}
                 except asyncio.TimeoutError:
                     break
-            return "⚠️ Omniston ما رد (timeout)"
+            return {"error": "timeout"}
     except Exception as e:
-        return f"❌ فشل الاتصال: {str(e)[:120]}"
+        return {"error": str(e)[:200]}
+
+async def build_full_transaction(quote):
+    try:
+        if not TON_MNEMONIC or len(TON_MNEMONIC) < 12:
+            return {"error": "no mnemonic"}
+        mnemonics, pub_k, priv_k, wallet = Wallets.from_mnemonics(
+            TON_MNEMONIC, WalletVersionEnum.v4r2, workchain=0
+        )
+        wallet_hex = wallet.address.to_string(is_user_friendly=False)
+
+        async with websockets.connect(
+            OMNISTON_WS_URL, ping_interval=20, ping_timeout=20
+        ) as ws:
+            request_id = str(uuid.uuid4())
+            payload = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "v1beta7.transaction.build_transfer",
+                "params": {
+                    "quote": quote,
+                    "source_address": {
+                        "blockchain": BLOCKCHAIN_ID,
+                        "address": wallet_hex,
+                    },
+                    "destination_address": {
+                        "blockchain": BLOCKCHAIN_ID,
+                        "address": wallet_hex,
+                    },
+                    "gas_excess_address": {
+                        "blockchain": BLOCKCHAIN_ID,
+                        "address": wallet_hex,
+                    },
+                    "use_recommended_slippage": True,
+                },
+            }
+            await ws.send(json.dumps(payload))
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(
+                        ws.recv(), timeout=max(0.1, deadline - time.time())
+                    )
+                    data = json.loads(raw)
+                    if data.get("error"):
+                        return {"error": str(data["error"])[:200]}
+                    if data.get("result"):
+                        return {"tx": data["result"]}
+                except asyncio.TimeoutError:
+                    break
+            return {"error": "timeout_build"}
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+async def test_omni_connection():
+    lines = ["🧪 <b>اختبار Omniston كامل</b>", ""]
+
+    lines.append("1️⃣ جاري جلب quote...")
+    q = await get_full_quote()
+    if "error" in q:
+        lines.append(f"❌ فشل Quote: {q['error'][:120]}")
+        return "\n".join(lines)
+
+    quote = q["quote"]
+    ask_units = quote.get("ask_units", "0")
+    try:
+        ask_float = int(ask_units) / 1e9
+    except Exception:
+        ask_float = 0
+    lines.append(f"✅ Quote: {ask_float:.4f} NOT مقابل 0.1 TON")
+    lines.append(f"   📊 حقول: {list(quote.keys())[:8]}")
+
+    lines.append("")
+    lines.append("2️⃣ جاري بناء المعاملة...")
+    tx_result = await build_full_transaction(quote)
+    if "error" in tx_result:
+        lines.append(f"❌ فشل Build: {tx_result['error'][:120]}")
+        return "\n".join(lines)
+
+    tx = tx_result["tx"]
+    if isinstance(tx, dict):
+        keys = list(tx.keys())[:10]
+        lines.append(f"✅ Build نجح!")
+        lines.append(f"   📊 حقول: {keys}")
+
+        ton_part = tx.get("ton") if "ton" in tx else None
+        if ton_part and isinstance(ton_part, dict):
+            msgs = ton_part.get("messages")
+            if isinstance(msgs, list):
+                lines.append(f"   📨 عدد الرسائل: {len(msgs)}")
+                if msgs:
+                    m = msgs[0]
+                    addr = m.get("target_address") or m.get("address", "?")
+                    lines.append(f"   📍 العنوان: {str(addr)[:30]}...")
+    else:
+        lines.append(f"✅ Build نجح! الرد: {str(tx)[:150]}")
+
+    lines.append("")
+    lines.append("🎯 <b>النتيجة:</b> Omniston شغال، ونقدر نبني الصفقة.")
+    lines.append("⏭️ الخطوة الجاية: تشغيل الوضع الحقيقي.")
+
+    return "\n".join(lines)
 
 # ═══════════════════════════════════════
 #   الحلقة الرئيسية
@@ -355,13 +452,13 @@ async def run_cycle(state):
                 f"📊 <b>حالة البوت</b>\n\n"
                 f"🔍 الوضع: {state['phase']}\n"
                 f"💼 صفقات: {len(state['trades'])}\n"
-                f"🧪 نتيجة الاختبار: {state.get('omni_test_result', 'ما تم')}"
+                f"🧪 نتيجة الاختبار: {state.get('omni_test_result', 'ما تم')[:80]}"
             )
         elif "اختبار" in text:
-            await send("🧪 جاري اختبار Omniston...")
+            await send("🧪 جاري اختبار Omniston كامل...")
             result = await test_omni_connection()
             state["omni_test_result"] = result
-            await send(f"<b>نتيجة الاختبار:</b>\n\n{result}")
+            await send(result)
 
     if state["phase"] == "paused":
         return state
@@ -370,23 +467,14 @@ async def run_cycle(state):
         best = await scan(state)
         if best and best["score"] >= 65:
             reasons_txt = "\n".join(f"• {r}" for r in best["reasons"][:5])
-            mode_txt = "🧪 <b>وضع اختبار (DRY RUN)</b>" if DRY_RUN else "🔥 <b>وضع حقيقي</b>"
+            mode_txt = "🧪 <b>وضع اختبار</b>" if DRY_RUN else "🔥 <b>وضع حقيقي</b>"
             await send(
                 f"🚨 <b>إشارة قوية!</b>\n{mode_txt}\n\n"
                 f"🪙 <b>{best['name']} ({best['symbol']})</b>\n"
                 f"💰 ${best['price']:.6f}\n"
                 f"📊 {best['score']:.0f}/100\n\n"
-                f"📝 <b>الأسباب:</b>\n{reasons_txt}\n\n"
-                f"{'🧪 ما راح نشتري (اختبار فقط)' if DRY_RUN else '🔥 جاري الشراء التلقائي...'}"
+                f"📝 <b>الأسباب:</b>\n{reasons_txt}"
             )
-
-            if DRY_RUN:
-                await send("🧪 <b>DRY RUN:</b> لو كان حقيقي، كان شريت الآن. للحقيقي غير DRY_RUN=0 في Settings.")
-            else:
-                # هنا راح نضيف الشراء الحقيقي بعد ما نختبر
-                await send("🔥 <b>الشراء الحقيقي قادم بالنسخة التالية</b>")
-
-            state["phase"] = "hunting"  # نبقى نبحث
         else:
             if best:
                 print(f"no signal ({best['symbol']}: {best['score']:.0f})")
@@ -412,11 +500,10 @@ async def main():
     )
     print("bot started")
 
-    # أول شي: اختبار Omniston
     await send("🧪 جاري اختبار Omniston أول مرة...")
     result = await test_omni_connection()
     state["omni_test_result"] = result
-    await send(f"<b>نتيجة اختبار Omniston:</b>\n\n{result}")
+    await send(result)
 
     start = time.time()
     while time.time() - start < 5 * 3600 + 50 * 60:
