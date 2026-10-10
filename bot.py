@@ -1,28 +1,41 @@
 import asyncio
-import base64
 import json
 import os
 import time
-import uuid
 from datetime import datetime
+from urllib.parse import quote
 from dotenv import load_dotenv
-from tonsdk.contract.wallet import Wallets, WalletVersionEnum
 import httpx
-import websockets
+
+try:
+    from wallet_risk import (
+        config as wallet_config,
+        get_portfolio_usd,
+        get_ton_balance,
+        get_ton_usd_price,
+        calculate_position,
+        pause as wallet_pause,
+        resume as wallet_resume,
+        set_manual_balance,
+        set_wallet,
+    )
+    WALLET_OK = True
+except Exception as e:
+    print(f"wallet_risk load failed: {e}")
+    WALLET_OK = False
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHAT_ID = os.getenv("CHAT_ID", "")
-TONCENTER_API_URL = "https://toncenter.com/api/v2"
-TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "")
-OMNISTON_WS_URL = "wss://omni-ws.ston.fi"
-TON_MNEMONIC = os.getenv("TON_MNEMONIC", "").split()
-DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
 STATE_FILE = "state.json"
-BLOCKCHAIN_ID = 607
 CYCLE_SLEEP = 60
+MIN_SCORE = 75
+STRONG_SCORE = 85
+MIN_LIQUIDITY = 10000
+COOLDOWN = 900
+DAILY_MAX_SIGNALS = 20
 
 TOKENS = {
     "NOT":  {"addr": "EQAvlWFDxGF2lXm67y4yzC17wYKD9A0guwPkMs1gOsM__NOT", "name": "Notcoin"},
@@ -31,388 +44,520 @@ TOKENS = {
 }
 
 DEFAULT_STATE = {
-    "phase": "hunting",
-    "current_symbol": None,
     "last_update_id": 0,
-    "last_update_time": 0,
     "price_history": {},
     "volume_history": {},
-    "trades": [],
-    "last_quote": None,
-    "omni_test_result": "",
+    "sent_signals": [],
+    "last_report": "",
+    "stats": {"signals_sent": 0},
 }
+
 
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE) as f:
-                s = json.load(f)
-                for k in DEFAULT_STATE:
-                    if k not in s:
-                        s[k] = DEFAULT_STATE[k]
-                return s
-        except Exception:
-            pass
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            state = dict(DEFAULT_STATE)
+            state.update(saved)
+            for k in ("price_history", "volume_history"):
+                if not isinstance(state.get(k), dict):
+                    state[k] = {}
+            if not isinstance(state.get("sent_signals"), list):
+                state["sent_signals"] = []
+            if not isinstance(state.get("stats"), dict):
+                state["stats"] = {"signals_sent": 0}
+            state["stats"].setdefault("signals_sent", 0)
+            state["last_update_id"] = int(state.get("last_update_id", 0) or 0)
+            return state
+        except Exception as e:
+            print(f"state load fail: {e}")
     return dict(DEFAULT_STATE)
 
-def save_state(s):
+
+def save_state(state):
+    tmp = STATE_FILE + ".tmp"
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(s, f, indent=2)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, STATE_FILE)
     except Exception as e:
         print(f"save fail: {e}")
 
-async def send(text):
+
+async def send(message):
     if not BOT_TOKEN or not CHAT_ID:
-        print(text)
-        return
-    max_len = 4000
-    chunks = [text[i:i+max_len] for i in range(0, len(text), max_len)]
-    for chunk in chunks:
-        try:
-            async with httpx.AsyncClient() as c:
-                await c.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    data={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML"},
-                    timeout=10,
-                )
-            await asyncio.sleep(0.3)
-        except Exception as e:
-            print(f"send fail: {e}")
+        print(message)
+        return False
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    chunks = []
+    remaining = message
+    while len(remaining) > 4000:
+        cut = remaining.rfind("\n", 0, 4000)
+        if cut < 1000:
+            cut = 4000
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            for chunk in chunks:
+                r = await c.post(url, data={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML"})
+                r.raise_for_status()
+                if not r.json().get("ok"):
+                    return False
+        return True
+    except Exception as e:
+        print(f"send fail: {e}")
+        return False
+
 
 async def get_updates(offset):
+    if not BOT_TOKEN:
+        return []
     try:
-        async with httpx.AsyncClient() as c:
+        async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-                params={"offset": offset, "timeout": 0},
-                timeout=15,
+                params={"offset": offset, "timeout": 0, "allowed_updates": json.dumps(["message"])},
             )
-            return r.json().get("result", [])
-    except Exception:
+            r.raise_for_status()
+            data = r.json()
+            return data.get("result", []) if data.get("ok") else []
+    except Exception as e:
+        print(f"getUpdates fail: {e}")
         return []
 
+
+def norm_addr(a):
+    return str(a or "").split("_")[0].strip().lower()
+
+
 async def get_price(addr):
+    url = "https://api.dexscreener.com/token-pairs/v1/ton/" + quote(addr, safe="")
     try:
-        async with httpx.AsyncClient() as c:
-            r = await c.get(
-                f"https://api.dexscreener.com/latest/dex/search?q={addr}",
-                timeout=10,
-            )
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(url)
+            r.raise_for_status()
             data = r.json()
-            if "pairs" in data and data["pairs"]:
-                pairs = sorted(
-                    data["pairs"],
-                    key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0,
-                    reverse=True,
-                )
-                p = pairs[0]
-                return {
-                    "price": float(p.get("priceUsd", 0) or 0),
-                    "volume": float(p.get("volume", {}).get("h24", 0) or 0),
-                    "liquidity": float(p.get("liquidity", {}).get("usd", 0) or 0),
-                }
-    except Exception:
-        pass
-    return None
+        if not isinstance(data, list):
+            return None
+        wanted = norm_addr(addr)
+        valid = []
+        for p in data:
+            if not isinstance(p, dict):
+                continue
+            if str(p.get("chainId", "")).lower() != "ton":
+                continue
+            base = p.get("baseToken") or {}
+            quote_t = p.get("quoteToken") or {}
+            ba = norm_addr(base.get("address"))
+            qa = norm_addr(quote_t.get("address"))
+            if wanted not in (ba, qa):
+                continue
+            try:
+                price = float(p.get("priceUsd") or 0)
+                liq = float((p.get("liquidity") or {}).get("usd") or 0)
+                vol = float((p.get("volume") or {}).get("h24") or 0)
+                ch = p.get("priceChange") or {}
+                c1 = float(ch.get("h1") or 0)
+                c24 = float(ch.get("h24") or 0)
+            except (ValueError, TypeError):
+                continue
+            if price <= 0:
+                continue
+            valid.append({"price": price, "volume": vol, "liquidity": liq, "change_1h": c1, "change_24h": c24})
+        if not valid:
+            return None
+        return max(valid, key=lambda x: x["liquidity"])
+    except Exception as e:
+        print(f"price fail: {e}")
+        return None
 
-# ═══════════════════════════════════════
-#   المؤشرات
-# ═══════════════════════════════════════
-def ema(d, p):
-    if len(d) < p:
-        return d[-1] if d else 0
-    k = 2 / (p + 1)
-    e = sum(d[:p]) / p
-    for x in d[p:]:
-        e = x * k + e * (1 - k)
-    return e
 
-def rsi(d, p=14):
-    if len(d) < p + 1:
-        return 50
-    g, l = [], []
-    for i in range(1, len(d)):
-        x = d[i] - d[i - 1]
-        g.append(max(x, 0))
-        l.append(max(-x, 0))
-    ag = sum(g[-p:]) / p
-    al = sum(l[-p:]) / p
+def ema(data, period):
+    if not data:
+        return 0.0
+    if len(data) < period:
+        return sum(data) / len(data)
+    k = 2 / (period + 1)
+    v = sum(data[:period]) / period
+    for x in data[period:]:
+        v = x * k + v * (1 - k)
+    return v
+
+
+def rsi(data, period=14):
+    if len(data) < period + 1:
+        return 50.0
+    changes = [data[i] - data[i - 1] for i in range(len(data) - period, len(data))]
+    gains = [max(x, 0) for x in changes]
+    losses = [max(-x, 0) for x in changes]
+    ag = sum(gains) / period
+    al = sum(losses) / period
+    if ag == 0 and al == 0:
+        return 50.0
     if al == 0:
-        return 100
-    return 100 - 100 / (1 + ag / al)
+        return 100.0
+    if ag == 0:
+        return 0.0
+    rs = ag / al
+    return 100 - 100 / (1 + rs)
 
-def macd_calc(d):
-    if len(d) < 26:
-        return {"macd": 0, "signal": 0, "hist": 0}
-    e12 = ema(d, 12)
-    e26 = ema(d, 26)
-    m = e12 - e26
-    series = [ema(d[:i], 12) - ema(d[:i], 26) for i in range(26, len(d) + 1)]
-    s = ema(series, 9) if len(series) >= 9 else m
+
+def macd_calc(data):
+    if len(data) < 35:
+        return {"macd": 0.0, "signal": 0.0, "hist": 0.0}
+    series = []
+    for i in range(26, len(data) + 1):
+        series.append(ema(data[:i], 12) - ema(data[:i], 26))
+    m = series[-1]
+    s = ema(series, 9)
     return {"macd": m, "signal": s, "hist": m - s}
 
-def weighted_score(prices):
-    if len(prices) < 20:
-        return 50, ["بيانات غير كافية"]
+
+def bollinger(data, period=20):
+    if len(data) < period:
+        return {"pos": 0.5}
+    values = data[-period:]
+    mean = sum(values) / period
+    var = sum((x - mean) ** 2 for x in values) / period
+    std = var ** 0.5
+    if std == 0:
+        return {"pos": 0.5}
+    up = mean + 2 * std
+    lo = mean - 2 * std
+    return {"pos": (data[-1] - lo) / (up - lo)}
+
+
+def weighted_score(prices, volumes):
+    if len(prices) < 35:
+        return 0.0, ["بيانات غير كافية"]
     reasons = []
-    ws, total = 0, 0
+    ws = 0.0
+    tw = 0.0
+
     r = rsi(prices)
     if r < 30:
-        s = 100; reasons.append(f"RSI={r:.0f}")
+        s = 100; reasons.append(f"RSI منخفض جدًا ({r:.0f})")
     elif r < 40:
-        s = 75
+        s = 70; reasons.append(f"RSI منخفض ({r:.0f})")
     elif r > 70:
-        s = 15
+        s = 10
     else:
-        s = 50
-    ws += s * 30; total += 30
+        s = 40
+    ws += s * 30; tw += 30
+
     m = macd_calc(prices)
-    if m["hist"] > 0:
-        s = 100; reasons.append("MACD+")
+    if m["hist"] > 0 and m["macd"] > m["signal"]:
+        s = 100; reasons.append("MACD صاعد")
+    elif m["hist"] > 0:
+        s = 60
     else:
-        s = 30
-    ws += s * 30; total += 30
+        s = 15
+    ws += s * 25; tw += 25
+
+    b = bollinger(prices)
+    if b["pos"] < 0.15:
+        s = 100; reasons.append("قاع بولينجر")
+    elif b["pos"] < 0.3:
+        s = 65
+    elif b["pos"] > 0.85:
+        s = 10
+    else:
+        s = 40
+    ws += s * 20; tw += 20
+
+    if len(volumes) >= 6:
+        avg = sum(volumes[-6:-1]) / 5
+        if avg > 0:
+            ratio = volumes[-1] / avg
+            if ratio > 2.5:
+                s = 100; reasons.append(f"حجم x{ratio:.1f}")
+            elif ratio > 1.5:
+                s = 65
+            else:
+                s = 40
+            ws += s * 15; tw += 15
+
     e9 = ema(prices, 9)
     e21 = ema(prices, 21)
     if e9 > e21:
-        s = 100; reasons.append("EMA+")
+        s = 80; reasons.append("EMA صاعد")
     else:
-        s = 30
-    ws += s * 40; total += 40
-    return min(100, ws / total if total > 0 else 50), reasons
+        s = 20
+    ws += s * 10; tw += 10
+
+    final = ws / tw if tw else 0
+    return min(100.0, max(0.0, final)), reasons
+
 
 async def scan(state):
     best = None
+    all_results = []
     for sym, info in TOKENS.items():
         md = await get_price(info["addr"])
-        if not md or md["price"] == 0:
+        if not md or md["price"] <= 0:
             continue
-        if sym not in state["price_history"]:
-            state["price_history"][sym] = []
+        state["price_history"].setdefault(sym, [])
+        state["volume_history"].setdefault(sym, [])
         state["price_history"][sym].append({"t": time.time(), "price": md["price"]})
         state["price_history"][sym] = state["price_history"][sym][-100:]
-        prices = [h["price"] for h in state["price_history"][sym]]
-        sc, reasons = weighted_score(prices)
-        if md["liquidity"] < 5000:
+        state["volume_history"][sym].append(md["volume"])
+        state["volume_history"][sym] = state["volume_history"][sym][-100:]
+
+        prices = [x["price"] for x in state["price_history"][sym] if isinstance(x, dict) and x.get("price", 0) > 0]
+        volumes = state["volume_history"][sym]
+        sc, reasons = weighted_score(prices, volumes)
+
+        if md["liquidity"] < MIN_LIQUIDITY:
             sc = 0
             reasons.append("سيولة ضعيفة")
-        if best is None or sc > best["score"]:
-            best = {"symbol": sym, "name": info["name"], "score": sc,
-                    "price": md["price"], "reasons": reasons, "liquidity": md["liquidity"]}
-    return best
 
-# ═══════════════════════════════════════
-#   Omniston: 1) Quote  2) Build
-# ═══════════════════════════════════════
-async def get_quote_via_events():
-    try:
-        async with websockets.connect(OMNISTON_WS_URL, ping_interval=20, ping_timeout=20) as ws:
-            req_id = str(uuid.uuid4())
-            payload = {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "method": "v1beta7.quote",
-                "params": {
-                    "bid_asset_address": {"blockchain": BLOCKCHAIN_ID,
-                        "address": "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c"},
-                    "ask_asset_address": {"blockchain": BLOCKCHAIN_ID,
-                        "address": TOKENS["NOT"]["addr"]},
-                    "amount": {"bid_units": "100000000"},
-                    "referrer_fee_bps": 0,
-                    "settlement_methods": [0],
-                },
-            }
-            await ws.send(json.dumps(payload))
-            quote_event = None
-            all_raw = []
-            deadline = time.time() + 20
-            while time.time() < deadline:
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=max(0.5, deadline - time.time()))
-                    data = json.loads(raw)
-                    all_raw.append(raw)
-                    if isinstance(data, dict):
-                        res = data.get("result")
-                        if isinstance(res, int):
-                            continue
-                        if isinstance(res, dict):
-                            return {"quote": res, "raw": all_raw}
-                        if data.get("method") == "event":
-                            event = data.get("params", {}).get("result", {}).get("event", {})
-                            if "quote_updated" in event:
-                                quote_event = event["quote_updated"]
-                                break
-                except asyncio.TimeoutError:
-                    break
-            if quote_event:
-                return {"quote": quote_event, "raw": all_raw}
-            return {"error": "no quote_updated", "raw": all_raw}
-    except Exception as e:
-        return {"error": f"exception: {str(e)[:150]}"}
+        cand = {
+            "symbol": sym, "name": info["name"], "score": sc,
+            "price": md["price"], "reasons": reasons,
+            "liquidity": md["liquidity"],
+            "change_1h": md["change_1h"], "change_24h": md["change_24h"],
+        }
+        all_results.append(cand)
+        if best is None or cand["score"] > best["score"]:
+            best = cand
+    return best, all_results
 
-async def build_transfer(quote):
-    """يبني المعاملة من quote. لا يوقّع ولا يرسل."""
-    try:
-        if not TON_MNEMONIC or len(TON_MNEMONIC) < 12:
-            return {"error": "no mnemonic"}
-        _, _, _, wallet = Wallets.from_mnemonics(TON_MNEMONIC, WalletVersionEnum.v4r2, workchain=0)
-        wallet_hex = wallet.address.to_string(is_user_friendly=False)
 
-        async with websockets.connect(OMNISTON_WS_URL, ping_interval=20, ping_timeout=20) as ws:
-            req_id = str(uuid.uuid4())
-            payload = {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "method": "v1beta7.transaction.build_transfer",
-                "params": {
-                    "quote": quote,
-                    "source_address": {"blockchain": BLOCKCHAIN_ID, "address": wallet_hex},
-                    "destination_address": {"blockchain": BLOCKCHAIN_ID, "address": wallet_hex},
-                    "gas_excess_address": {"blockchain": BLOCKCHAIN_ID, "address": wallet_hex},
-                    "use_recommended_slippage": True,
-                },
-            }
-            await ws.send(json.dumps(payload))
-            all_raw = []
-            deadline = time.time() + 25
-            while time.time() < deadline:
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=max(0.5, deadline - time.time()))
-                    data = json.loads(raw)
-                    all_raw.append(raw)
-                    if isinstance(data, dict):
-                        if data.get("error"):
-                            return {"error": f"build error: {str(data['error'])[:200]}", "raw": all_raw}
-                        res = data.get("result")
-                        if isinstance(res, dict):
-                            return {"tx": res, "raw": all_raw}
-                except asyncio.TimeoutError:
-                    break
-            return {"error": "no build result", "raw": all_raw}
-    except Exception as e:
-        return {"error": f"exception: {str(e)[:150]}"}
+def daily_count(state):
+    today = datetime.now().strftime("%Y-%m-%d")
+    return sum(1 for s in state["sent_signals"] if s.get("date") == today)
 
-async def test_quote():
-    lines = ["🧪 <b>اختبار 1: جلب Quote</b>", ""]
-    q = await get_quote_via_events()
-    if "error" in q:
-        lines.append(f"❌ {q['error'][:200]}")
-        return "\n".join(lines), None
-    quote = q["quote"]
-    ask = quote.get("ask_units", "0")
-    try:
-        ask_f = int(ask) / 1e9
-    except Exception:
-        ask_f = 0
-    lines.append(f"✅ Quote نجح!")
-    lines.append(f"💰 0.1 TON → {ask_f:.4f} NOT")
-    lines.append(f"📊 quote_id: {quote.get('quote_id', '?')[:20]}...")
-    lines.append("")
-    lines.append("🎯 الخطوة الجاية: اكتب <b>جرب البناء</b>")
-    return "\n".join(lines), quote
 
-async def test_build(quote):
-    lines = ["🧪 <b>اختبار 2: بناء المعاملة</b>", ""]
-    if not quote:
-        lines.append("❌ ماكو quote محفوظ. اكتب <b>اختبار</b> أول.")
-        return "\n".join(lines)
-    r = await build_transfer(quote)
-    if "error" in r:
-        lines.append(f"❌ {r['error'][:200]}")
-        raw = r.get("raw", [])
-        if raw:
-            lines.append("")
-            lines.append("📋 <b>آخر رد:</b>")
-            for x in raw[-2:]:
-                safe = x.replace("<", "&lt;").replace(">", "&gt;")
-                if len(safe) > 700:
-                    safe = safe[:700] + "..."
-                lines.append(f"<code>{safe}</code>")
-        return "\n".join(lines)
-    tx = r["tx"]
-    lines.append("✅ <b>Build نجح!</b>")
-    lines.append(f"📊 الحقول: {list(tx.keys())}")
-    lines.append("")
-    lines.append("🎯 قول لي: <b>هيك تمام</b> عشان نضيف التوقيع والإرسال.")
-    return "\n".join(lines)
+async def send_signal(state, best):
+    entry = best["price"]
+    tp = entry * 1.25
+    sl = entry * 0.92
 
-# ═══════════════════════════════════════
-#   الحلقة الرئيسية
-# ═══════════════════════════════════════
+    balance_usd = None
+    position_info = None
+    if WALLET_OK:
+        try:
+            balance_usd = float(await get_portfolio_usd())
+            if balance_usd > 0:
+                position_info = calculate_position(
+                    balance_usd=balance_usd,
+                    entry=entry,
+                    stop=sl,
+                    estimated_cost_pct=1.5,
+                )
+        except Exception as e:
+            print(f"position calc fail: {e}")
+
+    is_strong = best["score"] >= STRONG_SCORE
+
+    if is_strong:
+        if balance_usd:
+            size_usd = balance_usd * 0.9
+            advice = f"🔥 <b>ادخل بكل فلوسك!</b>\n💰 المبلغ المقترح: <b>${size_usd:.2f}</b> (90% من رصيدك)"
+        else:
+            advice = "🔥 <b>ادخل بكل فلوسك!</b>\n⚠️ حدد رصيدك أول: /setbalance 6.00"
+    else:
+        if position_info:
+            advice = f"🟢 ادخل بحجم: <b>${position_info['position_usd']:.2f}</b>"
+        else:
+            advice = f"🟢 ادخل بحجم معتدل"
+
+    reasons_txt = "\n".join(f"• {r}" for r in best["reasons"][:5]) or "• لا توجد أسباب كافية"
+
+    balance_line = ""
+    if balance_usd:
+        balance_line = f"💼 رصيدك: ${balance_usd:.2f}\n"
+
+    message = (
+        f"🚨 <b>إشارة {'قوية جداً' if is_strong else 'قوية'} - {best['name']}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"🪙 <b>{best['symbol']}</b>\n"
+        f"💰 السعر: <code>${entry:.8f}</code>\n"
+        f"📊 النقاط: <b>{best['score']:.0f}/100</b>\n"
+        f"💧 السيولة: ${best['liquidity']:,.0f}\n"
+        f"{balance_line}\n"
+        f"🎯 <b>الهدف (+25%):</b> <code>${tp:.8f}</code>\n"
+        f"🛑 <b>الوقف (-8%):</b> <code>${sl:.8f}</code>\n\n"
+        f"{advice}\n\n"
+        f"📝 <b>الأسباب:</b>\n{reasons_txt}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ إشارة آلية. ليست ضماناً للربح."
+    )
+
+    sent = await send(message)
+    if not sent:
+        return
+
+    state["sent_signals"].append({
+        "symbol": best["symbol"], "price": entry,
+        "tp": tp, "sl": sl, "t": time.time(),
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "score": best["score"],
+    })
+    state["sent_signals"] = state["sent_signals"][-200:]
+    state["stats"]["signals_sent"] += 1
+
+
 async def handle_messages(state):
-    offset = state.get("last_update_id", 0) + 1
-    updates = await get_updates(offset)
-    now = time.time()
+    updates = await get_updates(state.get("last_update_id", 0) + 1)
     for u in updates:
-        state["last_update_id"] = u["update_id"]
-        msg_date = u.get("message", {}).get("date", 0)
-        if now - msg_date > 120:
-            continue  # نتجاهل الرسائل الأقدم من دقيقتين
-        text = (u.get("message", {}).get("text") or "").strip().lower()
-        if not text:
+        state["last_update_id"] = max(state.get("last_update_id", 0), u.get("update_id", 0))
+        msg = u.get("message") or {}
+        chat = msg.get("chat") or {}
+        if not CHAT_ID or str(chat.get("id", "")) != CHAT_ID:
             continue
+        text = (msg.get("text") or "").strip()
+        low = text.lower()
 
-        if "حالة" in text:
+        if low in ("حالة", "/status"):
+            daily = daily_count(state)
+            bal_line = ""
+            if WALLET_OK:
+                try:
+                    b = await get_portfolio_usd()
+                    bal_line = f"💼 الرصيد: ${float(b):.2f}\n"
+                except Exception:
+                    bal_line = "💼 الرصيد: غير محدد\n"
             await send(
-                f"📊 <b>الحالة</b>\n"
-                f"🔍 الوضع: {state['phase']}\n"
-                f"💼 صفقات: {len(state['trades'])}\n"
-                f"🧪 آخر اختبار: {state.get('omni_test_result', 'ما تم')[:80]}"
+                f"📊 <b>حالة البوت</b>\n\n"
+                f"{bal_line}"
+                f"📨 إشارات اليوم: {daily}/{DAILY_MAX_SIGNALS}\n"
+                f"📨 الإجمالي: {state['stats']['signals_sent']}\n"
+                f"🎯 الحد: {MIN_SCORE}/100 (قوي جداً: {STRONG_SCORE}+)"
             )
-        elif "اختبار" in text and "بناء" not in text:
-            await send("🧪 جاري جلب Quote...")
-            result, quote = await test_quote()
-            state["omni_test_result"] = result[:200]
-            if quote:
-                state["last_quote"] = quote
-            await send(result)
-        elif "بناء" in text or "جرب البناء" in text:
-            await send("🧪 جاري بناء المعاملة...")
-            result = await test_build(state.get("last_quote"))
-            await send(result)
+
+        elif low in ("اختبار", "/test"):
+            await send("🧪 جاري فحص العملات...")
+            best, all_r = await scan(state)
+            if best:
+                txt = f"🧪 <b>نتيجة الفحص ({len(all_r)} عملة)</b>\n\n"
+                for r in sorted(all_r, key=lambda x: x["score"], reverse=True):
+                    txt += f"• <b>{r['symbol']}</b>: {r['score']:.0f}/100 | ${r['price']:.8f}\n"
+                await send(txt)
+            else:
+                await send("⚠️ ما وصلت بيانات")
+
+        elif low.startswith("/setbalance"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                await send("استخدام: /setbalance 6.00")
+                continue
+            try:
+                if WALLET_OK:
+                    amt = set_manual_balance(parts[1])
+                    await send(f"✅ تم تعيين الرصيد: ${float(amt):.2f}")
+                else:
+                    await send("⚠️ wallet_risk غير محمّل")
+            except Exception as e:
+                await send(f"❌ خطأ: {e}")
+
+        elif low.startswith("/wallet"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                await send("استخدام: /wallet <عنوان المحفظة>")
+                continue
+            try:
+                if WALLET_OK:
+                    set_wallet(parts[1])
+                    await send("✅ تم تعيين المحفظة")
+                else:
+                    await send("⚠️ wallet_risk غير محمّل")
+            except Exception as e:
+                await send(f"❌ خطأ: {e}")
+
+        elif low in ("/balance", "رصيد"):
+            if not WALLET_OK:
+                await send("⚠️ wallet_risk غير محمّل")
+                continue
+            try:
+                b = await get_portfolio_usd()
+                ton = None
+                try:
+                    ton = await get_ton_balance()
+                except Exception:
+                    pass
+                txt = f"💼 <b>الرصيد</b>\n\nالقيمة: ${float(b):.2f}"
+                if ton is not None:
+                    txt += f"\nTON: {float(ton):.4f}"
+                await send(txt)
+            except Exception as e:
+                await send(f"❌ خطأ: {e}")
+
+        elif low in ("/pause", "ايقاف"):
+            if WALLET_OK:
+                wallet_pause()
+            await send("⏸️ تم إيقاف الإشارات")
+
+        elif low in ("/resume", "تشغيل"):
+            if WALLET_OK:
+                wallet_resume()
+            await send("▶️ تم استئناف الإشارات")
 
     return state
+
 
 async def run_cycle(state):
-    state = await handle_messages(state)
+    await handle_messages(state)
 
-    if state["phase"] == "paused":
+    daily = daily_count(state)
+    if daily >= DAILY_MAX_SIGNALS:
         return state
 
-    if state["phase"] == "hunting":
-        best = await scan(state)
-        if best and best["score"] >= 65:
-            reasons_txt = "\n".join(f"• {r}" for r in best["reasons"][:5])
-            await send(
-                f"🚨 <b>إشارة!</b> 🧪 وضع اختبار\n\n"
-                f"🪙 {best['name']} ({best['symbol']})\n"
-                f"💰 ${best['price']:.6f}\n"
-                f"📊 {best['score']:.0f}/100\n\n{reasons_txt}"
-            )
+    best, _ = await scan(state)
+    if best:
+        print(f"scan: {best['symbol']}={best['score']:.0f}")
+        if best["score"] >= MIN_SCORE:
+            now = time.time()
+            recent = [
+                s for s in state["sent_signals"]
+                if s.get("symbol") == best["symbol"]
+                and now - s.get("t", 0) < COOLDOWN
+            ]
+            if not recent:
+                await send_signal(state, best)
 
     return state
 
+
 async def main():
+    if not BOT_TOKEN or not CHAT_ID:
+        print("خطأ: عيّن BOT_TOKEN و CHAT_ID")
+        return
+
     state = load_state()
+
     await send(
-        "🚀 <b>البوت شغال - وضع اختبار</b>\n\n"
-        "✍️ <b>اختبار</b> = جلب quote\n"
-        "✍️ <b>جرب البناء</b> = بناء المعاملة (بدون إرسال)\n"
-        "✍️ <b>حالة</b> = عرض الحالة"
+        "🚀 <b>بوت التحليل شغال</b>\n\n"
+        f"🪙 العملات: {len(TOKENS)}\n"
+        f"🎯 الحد الأدنى: {MIN_SCORE}/100\n"
+        f"🔥 إشارة قوية جداً: {STRONG_SCORE}+ (ادخل بكل فلوسك)\n"
+        f"📊 حد يومي: {DAILY_MAX_SIGNALS} إشارات\n\n"
+        "<b>الأوامر:</b>\n"
+        "/balance - عرض الرصيد\n"
+        "/setbalance - تعيين الرصيد\n"
+        "/wallet - تعيين المحفظة\n"
+        "/test - فحص فوري\n"
+        "/status - حالة البوت\n"
+        "/pause - إيقاف\n"
+        "/resume - استئناف"
     )
+
     print("bot started")
-
-    start = time.time()
-    while time.time() - start < 5 * 3600 + 50 * 60:
+    end_time = time.monotonic() + 5 * 3600 + 50 * 60
+    while time.monotonic() < end_time:
         try:
-            state = await run_cycle(state)
-            save_state(state)
+            await run_cycle(state)
         except Exception as e:
-            print(f"cycle error: {e}")
+            print(f"cycle error: {type(e).__name__}: {e}")
+        save_state(state)
         await asyncio.sleep(CYCLE_SLEEP)
-
     save_state(state)
     print("done")
 
-asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())
