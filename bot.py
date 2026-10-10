@@ -69,15 +69,20 @@ async def send(text):
     if not BOT_TOKEN or not CHAT_ID:
         print(text)
         return
-    try:
-        async with httpx.AsyncClient() as c:
-            await c.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
-                timeout=10,
-            )
-    except Exception as e:
-        print(f"send fail: {e}")
+    # تقطيع الرسائل الطويلة
+    max_len = 4000
+    chunks = [text[i:i+max_len] for i in range(0, len(text), max_len)]
+    for chunk in chunks:
+        try:
+            async with httpx.AsyncClient() as c:
+                await c.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    data={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML"},
+                    timeout=10,
+                )
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            print(f"send fail: {e}")
 
 async def get_updates(offset):
     try:
@@ -176,78 +181,58 @@ def weighted_score(prices, volumes):
         return 50, ["بيانات غير كافية"]
     reasons = []
     ws, total = 0, 0
-
     r = rsi(prices)
     if r < 30:
-        s = 100
-        reasons.append(f"RSI ذروة بيع ({r:.0f})")
+        s = 100; reasons.append(f"RSI ذروة بيع ({r:.0f})")
     elif r < 40:
-        s = 75
-        reasons.append(f"RSI منخفض ({r:.0f})")
+        s = 75; reasons.append(f"RSI منخفض ({r:.0f})")
     elif r > 70:
         s = 15
     else:
         s = 50
-    ws += s * 20
-    total += 20
-
+    ws += s * 20; total += 20
     m = macd_calc(prices)
     if m["hist"] > 0 and m["macd"] > m["signal"]:
-        s = 100
-        reasons.append("MACD صاعد")
+        s = 100; reasons.append("MACD صاعد")
     elif m["hist"] > 0:
         s = 70
     else:
         s = 20
-    ws += s * 15
-    total += 15
-
+    ws += s * 15; total += 15
     if len(volumes) >= 6:
         avg = sum(volumes[-6:-1]) / 5
         if avg > 0:
             ratio = volumes[-1] / avg
             if ratio > 2:
-                s = 100
-                reasons.append(f"حجم x{ratio:.1f}")
+                s = 100; reasons.append(f"حجم x{ratio:.1f}")
             elif ratio > 1.5:
                 s = 70
             else:
                 s = 50
-            ws += s * 15
-            total += 15
-
+            ws += s * 15; total += 15
     b = bollinger(prices)
     if b["pos"] < 0.15:
-        s = 100
-        reasons.append("قاع بولينجر")
+        s = 100; reasons.append("قاع بولينجر")
     elif b["pos"] < 0.3:
         s = 70
     elif b["pos"] > 0.85:
         s = 20
     else:
         s = 50
-    ws += s * 20
-    total += 20
-
+    ws += s * 20; total += 20
     e9 = ema(prices, 9)
     e21 = ema(prices, 21)
     if e9 > e21:
-        s = 100
-        reasons.append("EMA صاعد")
+        s = 100; reasons.append("EMA صاعد")
     else:
         s = 30
-    ws += s * 15
-    total += 15
-
+    ws += s * 15; total += 15
     st = stoch(prices)
     if st < 20:
-        s = 100
-        reasons.append("ستوكاستك منخفض")
+        s = 100; reasons.append("ستوكاستك منخفض")
     else:
         s = 50
-    ws += s * 15
-    total += 15
-
+    ws += s * 15; total += 15
     final = ws / total if total > 0 else 50
     return min(100, final), reasons
 
@@ -264,31 +249,29 @@ async def scan(state):
         state["price_history"][sym] = state["price_history"][sym][-100:]
         state["volume_history"][sym].append(md["volume"])
         state["volume_history"][sym] = state["volume_history"][sym][-100:]
-
         prices = [h["price"] for h in state["price_history"][sym]]
         volumes = state["volume_history"][sym]
         sc, reasons = weighted_score(prices, volumes)
-
         if md["liquidity"] < 5000:
             sc = 0
             reasons.append("سيولة ضعيفة")
-
         if best is None or sc > best["score"]:
             best = {
-                "symbol": sym,
-                "name": info["name"],
-                "score": sc,
-                "price": md["price"],
-                "reasons": reasons,
-                "liquidity": md["liquidity"],
+                "symbol": sym, "name": info["name"], "score": sc,
+                "price": md["price"], "reasons": reasons, "liquidity": md["liquidity"],
             }
     return best
 
 # ═══════════════════════════════════════
-#   Omniston - نسخة مُحصّنة
+#   Omniston - نظام Events/Subscriptions
 # ═══════════════════════════════════════
-async def get_full_quote():
-    raw_log = []
+async def get_quote_via_events():
+    """
+    يستمع للأحداث من Omniston.
+    أول رسالة: subscription confirmation (result = int)
+    بعدها: event notifications (method = "event")
+    نبحث عن quote_updated ونستخرج quote_id.
+    """
     try:
         async with websockets.connect(
             OMNISTON_WS_URL, ping_interval=20, ping_timeout=20
@@ -313,140 +296,89 @@ async def get_full_quote():
                 },
             }
             await ws.send(json.dumps(payload))
-            deadline = time.time() + 15
-            while time.time() < deadline:
-                try:
-                    raw = await asyncio.wait_for(
-                        ws.recv(), timeout=max(0.1, deadline - time.time())
-                    )
-                    raw_log.append(str(raw)[:200])
-                    data = json.loads(raw)
-                    if not isinstance(data, dict):
-                        continue
-                    if data.get("error"):
-                        return {"error": f"API error: {str(data['error'])[:150]}", "raw": raw_log}
-                    res = data.get("result")
-                    if isinstance(res, dict):
-                        if "ask_units" in res:
-                            return {"quote": res, "raw": raw_log}
-                        if "quote" in res and isinstance(res["quote"], dict):
-                            return {"quote": res["quote"], "raw": raw_log}
-                except asyncio.TimeoutError:
-                    break
-            return {"error": "لم يصل quote صحيح (كل الردود كانت أرقام أو غير معروفة)", "raw": raw_log}
-    except Exception as e:
-        return {"error": f"exception: {str(e)[:150]}", "raw": raw_log}
 
-async def build_full_transaction(quote):
-    try:
-        if not TON_MNEMONIC or len(TON_MNEMONIC) < 12:
-            return {"error": "no mnemonic"}
-        mnemonics, pub_k, priv_k, wallet = Wallets.from_mnemonics(
-            TON_MNEMONIC, WalletVersionEnum.v4r2, workchain=0
-        )
-        wallet_hex = wallet.address.to_string(is_user_friendly=False)
+            subscription_id = None
+            quote_event = None
+            all_raw = []
 
-        async with websockets.connect(
-            OMNISTON_WS_URL, ping_interval=20, ping_timeout=20
-        ) as ws:
-            request_id = str(uuid.uuid4())
-            payload = {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": "v1beta7.transaction.build_transfer",
-                "params": {
-                    "quote": quote,
-                    "source_address": {
-                        "blockchain": BLOCKCHAIN_ID,
-                        "address": wallet_hex,
-                    },
-                    "destination_address": {
-                        "blockchain": BLOCKCHAIN_ID,
-                        "address": wallet_hex,
-                    },
-                    "gas_excess_address": {
-                        "blockchain": BLOCKCHAIN_ID,
-                        "address": wallet_hex,
-                    },
-                    "use_recommended_slippage": True,
-                },
-            }
-            await ws.send(json.dumps(payload))
             deadline = time.time() + 20
             while time.time() < deadline:
                 try:
                     raw = await asyncio.wait_for(
-                        ws.recv(), timeout=max(0.1, deadline - time.time())
+                        ws.recv(), timeout=max(0.5, deadline - time.time())
                     )
                     data = json.loads(raw)
-                    if not isinstance(data, dict):
-                        continue
-                    if data.get("error"):
-                        return {"error": f"build error: {str(data['error'])[:150]}"}
-                    res = data.get("result")
-                    if isinstance(res, dict):
-                        return {"tx": res}
+                    all_raw.append(raw)
+
+                    # 1. subscription confirmation
+                    if isinstance(data, dict):
+                        res = data.get("result")
+                        if isinstance(res, int):
+                            subscription_id = res
+                            continue
+                        if isinstance(res, dict):
+                            return {"quote": res, "raw": all_raw}
+
+                        # 2. event
+                        if data.get("method") == "event":
+                            params = data.get("params", {})
+                            result = params.get("result", {})
+                            event = result.get("event", {})
+                            if "quote_updated" in event:
+                                quote_event = event["quote_updated"]
+                                break
+
                 except asyncio.TimeoutError:
                     break
-            return {"error": "timeout_build"}
+
+            if quote_event:
+                return {"quote_event": quote_event, "raw": all_raw}
+            return {"error": "لم يصل quote_updated", "raw": all_raw}
+
     except Exception as e:
         return {"error": f"exception: {str(e)[:150]}"}
 
 async def test_omni_connection():
     lines = ["🧪 <b>اختبار Omniston كامل</b>", ""]
 
-    lines.append("1️⃣ جلب quote...")
-    q = await get_full_quote()
+    lines.append("1️⃣ الاستماع للأحداث...")
+    q = await get_quote_via_events()
+
     if "error" in q:
-        lines.append(f"❌ <b>فشل Quote:</b> {q['error'][:150]}")
+        lines.append(f"❌ {q['error'][:150]}")
         raw = q.get("raw", [])
         if raw:
             lines.append("")
-            lines.append("📋 <b>آخر 3 ردود خام:</b>")
+            lines.append("📋 <b>آخر 3 ردود (كاملة):</b>")
             for r in raw[-3:]:
-                safe = r.replace("<", "&lt;").replace(">", "&gt;")[:180]
+                safe = r.replace("<", "&lt;").replace(">", "&gt;")
+                if len(safe) > 800:
+                    safe = safe[:800] + "..."
                 lines.append(f"<code>{safe}</code>")
         return "\n".join(lines)
 
-    quote = q["quote"]
+    quote = q.get("quote_event") or q.get("quote")
     if not isinstance(quote, dict):
-        lines.append(f"⚠️ Quote ليس dict: {type(quote).__name__}")
-        lines.append(f"القيمة: {str(quote)[:150]}")
+        lines.append(f"⚠️ شكل غير معروف: {type(quote).__name__}")
+        lines.append(f"{str(quote)[:200]}")
         return "\n".join(lines)
 
-    ask_units = quote.get("ask_units", "0")
+    lines.append("✅ <b>استلمنا quote_updated!</b>")
+    lines.append(f"📊 الحقول: {list(quote.keys())}")
+
+    # نبحث عن ask_units
+    ask = quote.get("ask_units") or quote.get("ask_amount") or 0
     try:
-        ask_float = int(ask_units) / 1e9
+        ask_f = int(ask) / 1e9
+        lines.append(f"💰 الناتج: {ask_f:.4f} NOT")
     except Exception:
-        ask_float = 0
-    lines.append(f"✅ <b>Quote نجح!</b>")
-    lines.append(f"💰 الناتج: {ask_float:.4f} NOT مقابل 0.1 TON")
-    lines.append(f"📊 الحقول: {list(quote.keys())[:8]}")
+        lines.append(f"💰 ask_units: {ask}")
 
+    # نحفظ الـ quote كامل للمرحلة الجاية
     lines.append("")
-    lines.append("2️⃣ بناء المعاملة...")
-    tx_result = await build_full_transaction(quote)
-    if "error" in tx_result:
-        lines.append(f"❌ <b>فشل Build:</b> {tx_result['error'][:150]}")
-        return "\n".join(lines)
+    lines.append("🎯 <b>الخطوة الجاية:</b> نبني المعاملة من هذا الـ quote.")
+    lines.append("⏭️ قول: <b>جرب البناء</b>")
 
-    tx = tx_result["tx"]
-    lines.append(f"✅ <b>Build نجح!</b>")
-    if isinstance(tx, dict):
-        lines.append(f"📊 حقول: {list(tx.keys())[:8]}")
-        ton_part = tx.get("ton") if "ton" in tx else None
-        if ton_part and isinstance(ton_part, dict):
-            msgs = ton_part.get("messages")
-            if isinstance(msgs, list):
-                lines.append(f"📨 عدد الرسائل: {len(msgs)}")
-                if msgs:
-                    m = msgs[0]
-                    addr = m.get("target_address") or m.get("address", "?")
-                    lines.append(f"📍 العنوان: {str(addr)[:30]}...")
-
-    lines.append("")
-    lines.append("🎯 <b>النتيجة: كل شي تمام!</b>")
-    lines.append("⏭️ الخطوة الجاية: تفعيل التنفيذ الحقيقي.")
     return "\n".join(lines)
 
 # ═══════════════════════════════════════
@@ -462,13 +394,12 @@ async def run_cycle(state):
             await send(
                 f"📊 <b>حالة البوت</b>\n\n"
                 f"🔍 الوضع: {state['phase']}\n"
-                f"💼 صفقات: {len(state['trades'])}\n"
-                f"🧪 آخر اختبار: {state.get('omni_test_result', 'ما تم')[:80]}"
+                f"💼 صفقات: {len(state['trades'])}"
             )
         elif "اختبار" in text:
-            await send("🧪 جاري اختبار Omniston كامل...")
+            await send("🧪 جاري الاختبار...")
             result = await test_omni_connection()
-            state["omni_test_result"] = result
+            state["omni_test_result"] = result[:200]
             await send(result)
 
     if state["phase"] == "paused":
@@ -490,30 +421,19 @@ async def run_cycle(state):
             if best:
                 print(f"no signal ({best['symbol']}: {best['score']:.0f})")
 
-    await daily_report(state)
     return state
-
-async def daily_report(state):
-    now = datetime.now()
-    today = now.strftime("%Y-%m-%d")
-    if state.get("last_daily_report") == today or now.hour < 20:
-        return
-    state["last_daily_report"] = today
-    await send(f"📊 <b>التقرير اليومي</b>\n📅 {today}\n📈 صفقات: {len(state['trades'])}")
 
 async def main():
     state = load_state()
     await send(
-        "🚀 <b>البوت شغال - وضع الاختبار</b>\n\n"
-        "🧪 ما راح يشتري شي. فقط يحلل ويراقب.\n"
-        "✍️ اكتب: <b>اختبار</b> لفحص Omniston\n"
-        "✍️ اكتب: <b>حالة</b> لعرض الوضع"
+        "🚀 <b>البوت شغال - وضع اختبار</b>\n\n"
+        "✍️ اكتب: <b>اختبار</b> لفحص Omniston"
     )
     print("bot started")
 
     await send("🧪 جاري اختبار Omniston أول مرة...")
     result = await test_omni_connection()
-    state["omni_test_result"] = result
+    state["omni_test_result"] = result[:200]
     await send(result)
 
     start = time.time()
