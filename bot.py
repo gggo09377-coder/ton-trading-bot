@@ -12,9 +12,6 @@ import websockets
 
 load_dotenv()
 
-# ═══════════════════════════════════════
-#   الإعدادات
-# ═══════════════════════════════════════
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 TONCENTER_API_URL = "https://toncenter.com/api/v2"
@@ -118,9 +115,6 @@ async def get_price(addr):
         pass
     return None
 
-# ═══════════════════════════════════════
-#   المؤشرات
-# ═══════════════════════════════════════
 def ema(d, p):
     if len(d) < p:
         return d[-1] if d else 0
@@ -177,21 +171,6 @@ def stoch(d, p=14):
         return 50
     return 100 * (d[-1] - l) / (h - l)
 
-def detect_regime(prices):
-    if len(prices) < 30:
-        return "unknown"
-    at = sum(abs(prices[i] - prices[i - 1]) for i in range(1, min(15, len(prices)))) / 14
-    vol = at / prices[-1] if prices[-1] > 0 else 0
-    e9 = ema(prices, 9)
-    e21 = ema(prices, 21)
-    if vol > 0.08:
-        return "volatile"
-    if e9 > e21:
-        return "bullish"
-    if e9 < e21:
-        return "bearish"
-    return "neutral"
-
 def weighted_score(prices, volumes):
     if len(prices) < 20:
         return 50, ["بيانات غير كافية"]
@@ -200,61 +179,74 @@ def weighted_score(prices, volumes):
 
     r = rsi(prices)
     if r < 30:
-        s = 100; reasons.append(f"RSI ذروة بيع ({r:.0f})")
+        s = 100
+        reasons.append(f"RSI ذروة بيع ({r:.0f})")
     elif r < 40:
-        s = 75; reasons.append(f"RSI منخفض ({r:.0f})")
+        s = 75
+        reasons.append(f"RSI منخفض ({r:.0f})")
     elif r > 70:
         s = 15
     else:
         s = 50
-    ws += s * 20; total += 20
+    ws += s * 20
+    total += 20
 
     m = macd_calc(prices)
     if m["hist"] > 0 and m["macd"] > m["signal"]:
-        s = 100; reasons.append("MACD صاعد")
+        s = 100
+        reasons.append("MACD صاعد")
     elif m["hist"] > 0:
         s = 70
     else:
         s = 20
-    ws += s * 15; total += 15
+    ws += s * 15
+    total += 15
 
     if len(volumes) >= 6:
         avg = sum(volumes[-6:-1]) / 5
         if avg > 0:
             ratio = volumes[-1] / avg
             if ratio > 2:
-                s = 100; reasons.append(f"حجم x{ratio:.1f}")
+                s = 100
+                reasons.append(f"حجم x{ratio:.1f}")
             elif ratio > 1.5:
                 s = 70
             else:
                 s = 50
-            ws += s * 15; total += 15
+            ws += s * 15
+            total += 15
 
     b = bollinger(prices)
     if b["pos"] < 0.15:
-        s = 100; reasons.append("قاع بولينجر")
+        s = 100
+        reasons.append("قاع بولينجر")
     elif b["pos"] < 0.3:
         s = 70
     elif b["pos"] > 0.85:
         s = 20
     else:
         s = 50
-    ws += s * 20; total += 20
+    ws += s * 20
+    total += 20
 
     e9 = ema(prices, 9)
     e21 = ema(prices, 21)
     if e9 > e21:
-        s = 100; reasons.append("EMA صاعد")
+        s = 100
+        reasons.append("EMA صاعد")
     else:
         s = 30
-    ws += s * 15; total += 15
+    ws += s * 15
+    total += 15
 
     st = stoch(prices)
     if st < 20:
-        s = 100; reasons.append("ستوكاستك منخفض")
+        s = 100
+        reasons.append("ستوكاستك منخفض")
     else:
         s = 50
-    ws += s * 15; total += 15
+    ws += s * 15
+    total += 15
 
     final = ws / total if total > 0 else 50
     return min(100, final), reasons
@@ -293,9 +285,10 @@ async def scan(state):
     return best
 
 # ═══════════════════════════════════════
-#   Omniston
+#   Omniston - نسخة مُحصّنة
 # ═══════════════════════════════════════
 async def get_full_quote():
+    raw_log = []
     try:
         async with websockets.connect(
             OMNISTON_WS_URL, ping_interval=20, ping_timeout=20
@@ -326,16 +319,23 @@ async def get_full_quote():
                     raw = await asyncio.wait_for(
                         ws.recv(), timeout=max(0.1, deadline - time.time())
                     )
+                    raw_log.append(str(raw)[:200])
                     data = json.loads(raw)
+                    if not isinstance(data, dict):
+                        continue
                     if data.get("error"):
-                        return {"error": str(data["error"])[:200]}
-                    if data.get("result"):
-                        return {"quote": data["result"]}
+                        return {"error": f"API error: {str(data['error'])[:150]}", "raw": raw_log}
+                    res = data.get("result")
+                    if isinstance(res, dict):
+                        if "ask_units" in res:
+                            return {"quote": res, "raw": raw_log}
+                        if "quote" in res and isinstance(res["quote"], dict):
+                            return {"quote": res["quote"], "raw": raw_log}
                 except asyncio.TimeoutError:
                     break
-            return {"error": "timeout"}
+            return {"error": "لم يصل quote صحيح (كل الردود كانت أرقام أو غير معروفة)", "raw": raw_log}
     except Exception as e:
-        return {"error": str(e)[:200]}
+        return {"error": f"exception: {str(e)[:150]}", "raw": raw_log}
 
 async def build_full_transaction(quote):
     try:
@@ -379,63 +379,74 @@ async def build_full_transaction(quote):
                         ws.recv(), timeout=max(0.1, deadline - time.time())
                     )
                     data = json.loads(raw)
+                    if not isinstance(data, dict):
+                        continue
                     if data.get("error"):
-                        return {"error": str(data["error"])[:200]}
-                    if data.get("result"):
-                        return {"tx": data["result"]}
+                        return {"error": f"build error: {str(data['error'])[:150]}"}
+                    res = data.get("result")
+                    if isinstance(res, dict):
+                        return {"tx": res}
                 except asyncio.TimeoutError:
                     break
             return {"error": "timeout_build"}
     except Exception as e:
-        return {"error": str(e)[:200]}
+        return {"error": f"exception: {str(e)[:150]}"}
 
 async def test_omni_connection():
     lines = ["🧪 <b>اختبار Omniston كامل</b>", ""]
 
-    lines.append("1️⃣ جاري جلب quote...")
+    lines.append("1️⃣ جلب quote...")
     q = await get_full_quote()
     if "error" in q:
-        lines.append(f"❌ فشل Quote: {q['error'][:120]}")
+        lines.append(f"❌ <b>فشل Quote:</b> {q['error'][:150]}")
+        raw = q.get("raw", [])
+        if raw:
+            lines.append("")
+            lines.append("📋 <b>آخر 3 ردود خام:</b>")
+            for r in raw[-3:]:
+                safe = r.replace("<", "&lt;").replace(">", "&gt;")[:180]
+                lines.append(f"<code>{safe}</code>")
         return "\n".join(lines)
 
     quote = q["quote"]
+    if not isinstance(quote, dict):
+        lines.append(f"⚠️ Quote ليس dict: {type(quote).__name__}")
+        lines.append(f"القيمة: {str(quote)[:150]}")
+        return "\n".join(lines)
+
     ask_units = quote.get("ask_units", "0")
     try:
         ask_float = int(ask_units) / 1e9
     except Exception:
         ask_float = 0
-    lines.append(f"✅ Quote: {ask_float:.4f} NOT مقابل 0.1 TON")
-    lines.append(f"   📊 حقول: {list(quote.keys())[:8]}")
+    lines.append(f"✅ <b>Quote نجح!</b>")
+    lines.append(f"💰 الناتج: {ask_float:.4f} NOT مقابل 0.1 TON")
+    lines.append(f"📊 الحقول: {list(quote.keys())[:8]}")
 
     lines.append("")
-    lines.append("2️⃣ جاري بناء المعاملة...")
+    lines.append("2️⃣ بناء المعاملة...")
     tx_result = await build_full_transaction(quote)
     if "error" in tx_result:
-        lines.append(f"❌ فشل Build: {tx_result['error'][:120]}")
+        lines.append(f"❌ <b>فشل Build:</b> {tx_result['error'][:150]}")
         return "\n".join(lines)
 
     tx = tx_result["tx"]
+    lines.append(f"✅ <b>Build نجح!</b>")
     if isinstance(tx, dict):
-        keys = list(tx.keys())[:10]
-        lines.append(f"✅ Build نجح!")
-        lines.append(f"   📊 حقول: {keys}")
-
+        lines.append(f"📊 حقول: {list(tx.keys())[:8]}")
         ton_part = tx.get("ton") if "ton" in tx else None
         if ton_part and isinstance(ton_part, dict):
             msgs = ton_part.get("messages")
             if isinstance(msgs, list):
-                lines.append(f"   📨 عدد الرسائل: {len(msgs)}")
+                lines.append(f"📨 عدد الرسائل: {len(msgs)}")
                 if msgs:
                     m = msgs[0]
                     addr = m.get("target_address") or m.get("address", "?")
-                    lines.append(f"   📍 العنوان: {str(addr)[:30]}...")
-    else:
-        lines.append(f"✅ Build نجح! الرد: {str(tx)[:150]}")
+                    lines.append(f"📍 العنوان: {str(addr)[:30]}...")
 
     lines.append("")
-    lines.append("🎯 <b>النتيجة:</b> Omniston شغال، ونقدر نبني الصفقة.")
-    lines.append("⏭️ الخطوة الجاية: تشغيل الوضع الحقيقي.")
-
+    lines.append("🎯 <b>النتيجة: كل شي تمام!</b>")
+    lines.append("⏭️ الخطوة الجاية: تفعيل التنفيذ الحقيقي.")
     return "\n".join(lines)
 
 # ═══════════════════════════════════════
@@ -452,7 +463,7 @@ async def run_cycle(state):
                 f"📊 <b>حالة البوت</b>\n\n"
                 f"🔍 الوضع: {state['phase']}\n"
                 f"💼 صفقات: {len(state['trades'])}\n"
-                f"🧪 نتيجة الاختبار: {state.get('omni_test_result', 'ما تم')[:80]}"
+                f"🧪 آخر اختبار: {state.get('omni_test_result', 'ما تم')[:80]}"
             )
         elif "اختبار" in text:
             await send("🧪 جاري اختبار Omniston كامل...")
