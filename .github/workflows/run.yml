@@ -23,14 +23,13 @@ jobs:
           python-version: '3.11'
       - name: Install deps
         run: pip install -r requirements.txt
-      - name: Run once
+      - name: Run
         env:
           TON_MNEMONIC: ${{ secrets.TON_MNEMONIC }}
           TONCENTER_API_KEY: ${{ secrets.TONCENTER_API_KEY }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          TONCENTER_API_URL: https://toncenter.com/api/v2
-          OMNISTON_WS_URL: wss://omni-ws.ston.fi
+          DRY_RUN: "1"
         run: python run_once.py
       - name: Commit state
         run: |
