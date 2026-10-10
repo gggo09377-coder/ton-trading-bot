@@ -4,6 +4,7 @@ import time
 import asyncio
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from datetime import datetime, timezone
 
 import httpx
 
@@ -12,7 +13,9 @@ DATA_DIR.mkdir(exist_ok=True)
 CONFIG_FILE = DATA_DIR / "wallet_risk.json"
 
 TON_API = os.getenv("TON_API_BASE", "https://toncenter.com/api/v2")
-TON_API_KEY = os.getenv("TON_API_KEY", "")
+TON_API_KEY = os.getenv("TONCENTER_API_KEY", "")
+TONCENTER_V3 = "https://toncenter.com/api/v3"
+DEXPAPRIKA_API_KEY = os.getenv("DEXPAPRIKA_API_KEY", "").strip()
 
 DEFAULTS = {
     "wallet_address": "",
@@ -200,3 +203,127 @@ def status():
         "last_balance_check": config["last_balance_check"],
         "mode": "READ_ONLY_PAPER_TRADING",
     }
+
+
+async def find_pool_for_token(token_address):
+    url = "https://api.dexpaprika.com/networks/ton/pools/search"
+    params = {
+        "token_address": token_address,
+        "order_by": "volume_usd_24h",
+        "sort": "desc",
+        "limit": 5,
+    }
+    headers = {}
+    if DEXPAPRIKA_API_KEY:
+        headers["Authorization"] = DEXPAPRIKA_API_KEY
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url, params=params, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+        results = data.get("results") or []
+        if not results:
+            return None
+        return results[0].get("id")
+    except Exception as e:
+        print(f"dexpaprika pool fail: {e}")
+        return None
+
+
+async def get_ohlcv(pool_address, interval="1m", limit=100):
+    url = f"https://api.dexpaprika.com/networks/ton/pools/{pool_address}/ohlcv"
+    params = {"interval": interval, "limit": limit}
+    headers = {}
+    if DEXPAPRIKA_API_KEY:
+        headers["Authorization"] = DEXPAPRIKA_API_KEY
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url, params=params, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+        if not isinstance(data, list):
+            return []
+        candles = []
+        for c in data:
+            try:
+                t_str = c.get("time_open", "")
+                t = int(datetime.fromisoformat(t_str.replace("Z", "+00:00")).timestamp())
+                candles.append({
+                    "t": t,
+                    "o": float(c.get("open", 0) or 0),
+                    "h": float(c.get("high", 0) or 0),
+                    "l": float(c.get("low", 0) or 0),
+                    "c": float(c.get("close", 0) or 0),
+                })
+            except (ValueError, TypeError):
+                continue
+        return candles
+    except Exception as e:
+        print(f"dexpaprika ohlcv fail: {e}")
+        return []
+
+
+async def get_recent_swaps(wallet_address, limit=20):
+    url = f"{TONCENTER_V3}/actions"
+    params = {
+        "account": wallet_address,
+        "action_type": "jetton_swap",
+        "limit": limit,
+        "sort": "desc",
+    }
+    headers = {}
+    if TON_API_KEY:
+        headers["X-API-Key"] = TON_API_KEY
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url, params=params, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+        if isinstance(data, dict):
+            return data.get("actions") or data.get("result") or []
+        return []
+    except Exception as e:
+        print(f"toncenter v3 swaps fail: {e}")
+        return []
+
+
+def find_swap_for_token(swaps, token_address, since_time=0):
+    token_norm = token_address.split("_")[0].strip().lower()
+    for action in swaps:
+        swap = action.get("jetton_swap") or action.get("jettonSwap") or {}
+        if not swap:
+            continue
+        in_addr = ((swap.get("jetton_master_in") or {}).get("address") or "")
+        out_addr = ((swap.get("jetton_master_out") or {}).get("address") or "")
+        in_addr = in_addr.split("_")[0].strip().lower()
+        out_addr = out_addr.split("_")[0].strip().lower()
+        if token_norm not in (in_addr, out_addr):
+            continue
+        t = action.get("start_utime", 0) or action.get("end_utime", 0)
+        try:
+            t = int(t)
+        except (ValueError, TypeError):
+            t = 0
+        if t >= since_time:
+            return action
+    return None
+
+
+async def get_actual_swap_price(token_address, swap_action):
+    ts = swap_action.get("start_utime", 0) or swap_action.get("end_utime", 0)
+    try:
+        ts = int(ts)
+    except (ValueError, TypeError):
+        return None
+    if not ts:
+        return None
+    pool = await find_pool_for_token(token_address)
+    if not pool:
+        return None
+    candles = await get_ohlcv(pool, interval="1m", limit=200)
+    if not candles:
+        candles = await get_ohlcv(pool, interval="1h", limit=100)
+    if not candles:
+        return None
+    closest = min(candles, key=lambda c: abs(c["t"] - ts))
+    return closest["c"]
