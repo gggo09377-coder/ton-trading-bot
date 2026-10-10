@@ -33,15 +33,12 @@ TOKENS = {
 DEFAULT_STATE = {
     "phase": "hunting",
     "current_symbol": None,
-    "entry_price": 0.0,
-    "target_price": 0.0,
-    "trailing_stop": 0.0,
-    "highest_price": 0.0,
     "last_update_id": 0,
+    "last_update_time": 0,
     "price_history": {},
     "volume_history": {},
     "trades": [],
-    "last_daily_report": "",
+    "last_quote": None,
     "omni_test_result": "",
 }
 
@@ -69,7 +66,6 @@ async def send(text):
     if not BOT_TOKEN or not CHAT_ID:
         print(text)
         return
-    # تقطيع الرسائل الطويلة
     max_len = 4000
     chunks = [text[i:i+max_len] for i in range(0, len(text), max_len)]
     for chunk in chunks:
@@ -80,7 +76,7 @@ async def send(text):
                     data={"chat_id": CHAT_ID, "text": chunk, "parse_mode": "HTML"},
                     timeout=10,
                 )
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
         except Exception as e:
             print(f"send fail: {e}")
 
@@ -120,6 +116,9 @@ async def get_price(addr):
         pass
     return None
 
+# ═══════════════════════════════════════
+#   المؤشرات
+# ═══════════════════════════════════════
 def ema(d, p):
     if len(d) < p:
         return d[-1] if d else 0
@@ -153,88 +152,35 @@ def macd_calc(d):
     s = ema(series, 9) if len(series) >= 9 else m
     return {"macd": m, "signal": s, "hist": m - s}
 
-def bollinger(d, p=20):
-    if len(d) < p:
-        return {"pos": 0.5}
-    r = d[-p:]
-    m = sum(r) / p
-    sd = (sum((x - m) ** 2 for x in r) / p) ** 0.5
-    if sd == 0:
-        return {"pos": 0.5}
-    up = m + 2 * sd
-    lo = m - 2 * sd
-    if up == lo:
-        return {"pos": 0.5}
-    return {"pos": (d[-1] - lo) / (up - lo)}
-
-def stoch(d, p=14):
-    if len(d) < p:
-        return 50
-    r = d[-p:]
-    h, l = max(r), min(r)
-    if h == l:
-        return 50
-    return 100 * (d[-1] - l) / (h - l)
-
-def weighted_score(prices, volumes):
+def weighted_score(prices):
     if len(prices) < 20:
         return 50, ["بيانات غير كافية"]
     reasons = []
     ws, total = 0, 0
     r = rsi(prices)
     if r < 30:
-        s = 100; reasons.append(f"RSI ذروة بيع ({r:.0f})")
+        s = 100; reasons.append(f"RSI={r:.0f}")
     elif r < 40:
-        s = 75; reasons.append(f"RSI منخفض ({r:.0f})")
+        s = 75
     elif r > 70:
         s = 15
     else:
         s = 50
-    ws += s * 20; total += 20
+    ws += s * 30; total += 30
     m = macd_calc(prices)
-    if m["hist"] > 0 and m["macd"] > m["signal"]:
-        s = 100; reasons.append("MACD صاعد")
-    elif m["hist"] > 0:
-        s = 70
+    if m["hist"] > 0:
+        s = 100; reasons.append("MACD+")
     else:
-        s = 20
-    ws += s * 15; total += 15
-    if len(volumes) >= 6:
-        avg = sum(volumes[-6:-1]) / 5
-        if avg > 0:
-            ratio = volumes[-1] / avg
-            if ratio > 2:
-                s = 100; reasons.append(f"حجم x{ratio:.1f}")
-            elif ratio > 1.5:
-                s = 70
-            else:
-                s = 50
-            ws += s * 15; total += 15
-    b = bollinger(prices)
-    if b["pos"] < 0.15:
-        s = 100; reasons.append("قاع بولينجر")
-    elif b["pos"] < 0.3:
-        s = 70
-    elif b["pos"] > 0.85:
-        s = 20
-    else:
-        s = 50
-    ws += s * 20; total += 20
+        s = 30
+    ws += s * 30; total += 30
     e9 = ema(prices, 9)
     e21 = ema(prices, 21)
     if e9 > e21:
-        s = 100; reasons.append("EMA صاعد")
+        s = 100; reasons.append("EMA+")
     else:
         s = 30
-    ws += s * 15; total += 15
-    st = stoch(prices)
-    if st < 20:
-        s = 100; reasons.append("ستوكاستك منخفض")
-    else:
-        s = 50
-    ws += s * 15; total += 15
-    final = ws / total if total > 0 else 50
-    return min(100, final), reasons
+    ws += s * 40; total += 40
+    return min(100, ws / total if total > 0 else 50), reasons
 
 async def scan(state):
     best = None
@@ -244,163 +190,192 @@ async def scan(state):
             continue
         if sym not in state["price_history"]:
             state["price_history"][sym] = []
-            state["volume_history"][sym] = []
         state["price_history"][sym].append({"t": time.time(), "price": md["price"]})
         state["price_history"][sym] = state["price_history"][sym][-100:]
-        state["volume_history"][sym].append(md["volume"])
-        state["volume_history"][sym] = state["volume_history"][sym][-100:]
         prices = [h["price"] for h in state["price_history"][sym]]
-        volumes = state["volume_history"][sym]
-        sc, reasons = weighted_score(prices, volumes)
+        sc, reasons = weighted_score(prices)
         if md["liquidity"] < 5000:
             sc = 0
             reasons.append("سيولة ضعيفة")
         if best is None or sc > best["score"]:
-            best = {
-                "symbol": sym, "name": info["name"], "score": sc,
-                "price": md["price"], "reasons": reasons, "liquidity": md["liquidity"],
-            }
+            best = {"symbol": sym, "name": info["name"], "score": sc,
+                    "price": md["price"], "reasons": reasons, "liquidity": md["liquidity"]}
     return best
 
 # ═══════════════════════════════════════
-#   Omniston - نظام Events/Subscriptions
+#   Omniston: 1) Quote  2) Build
 # ═══════════════════════════════════════
 async def get_quote_via_events():
-    """
-    يستمع للأحداث من Omniston.
-    أول رسالة: subscription confirmation (result = int)
-    بعدها: event notifications (method = "event")
-    نبحث عن quote_updated ونستخرج quote_id.
-    """
     try:
-        async with websockets.connect(
-            OMNISTON_WS_URL, ping_interval=20, ping_timeout=20
-        ) as ws:
-            request_id = str(uuid.uuid4())
+        async with websockets.connect(OMNISTON_WS_URL, ping_interval=20, ping_timeout=20) as ws:
+            req_id = str(uuid.uuid4())
             payload = {
                 "jsonrpc": "2.0",
-                "id": request_id,
+                "id": req_id,
                 "method": "v1beta7.quote",
                 "params": {
-                    "bid_asset_address": {
-                        "blockchain": BLOCKCHAIN_ID,
-                        "address": "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c",
-                    },
-                    "ask_asset_address": {
-                        "blockchain": BLOCKCHAIN_ID,
-                        "address": TOKENS["NOT"]["addr"],
-                    },
+                    "bid_asset_address": {"blockchain": BLOCKCHAIN_ID,
+                        "address": "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c"},
+                    "ask_asset_address": {"blockchain": BLOCKCHAIN_ID,
+                        "address": TOKENS["NOT"]["addr"]},
                     "amount": {"bid_units": "100000000"},
                     "referrer_fee_bps": 0,
                     "settlement_methods": [0],
                 },
             }
             await ws.send(json.dumps(payload))
-
-            subscription_id = None
             quote_event = None
             all_raw = []
-
             deadline = time.time() + 20
             while time.time() < deadline:
                 try:
-                    raw = await asyncio.wait_for(
-                        ws.recv(), timeout=max(0.5, deadline - time.time())
-                    )
+                    raw = await asyncio.wait_for(ws.recv(), timeout=max(0.5, deadline - time.time()))
                     data = json.loads(raw)
                     all_raw.append(raw)
-
-                    # 1. subscription confirmation
                     if isinstance(data, dict):
                         res = data.get("result")
                         if isinstance(res, int):
-                            subscription_id = res
                             continue
                         if isinstance(res, dict):
                             return {"quote": res, "raw": all_raw}
-
-                        # 2. event
                         if data.get("method") == "event":
-                            params = data.get("params", {})
-                            result = params.get("result", {})
-                            event = result.get("event", {})
+                            event = data.get("params", {}).get("result", {}).get("event", {})
                             if "quote_updated" in event:
                                 quote_event = event["quote_updated"]
                                 break
-
                 except asyncio.TimeoutError:
                     break
-
             if quote_event:
-                return {"quote_event": quote_event, "raw": all_raw}
-            return {"error": "لم يصل quote_updated", "raw": all_raw}
-
+                return {"quote": quote_event, "raw": all_raw}
+            return {"error": "no quote_updated", "raw": all_raw}
     except Exception as e:
         return {"error": f"exception: {str(e)[:150]}"}
 
-async def test_omni_connection():
-    lines = ["🧪 <b>اختبار Omniston كامل</b>", ""]
+async def build_transfer(quote):
+    """يبني المعاملة من quote. لا يوقّع ولا يرسل."""
+    try:
+        if not TON_MNEMONIC or len(TON_MNEMONIC) < 12:
+            return {"error": "no mnemonic"}
+        _, _, _, wallet = Wallets.from_mnemonics(TON_MNEMONIC, WalletVersionEnum.v4r2, workchain=0)
+        wallet_hex = wallet.address.to_string(is_user_friendly=False)
 
-    lines.append("1️⃣ الاستماع للأحداث...")
+        async with websockets.connect(OMNISTON_WS_URL, ping_interval=20, ping_timeout=20) as ws:
+            req_id = str(uuid.uuid4())
+            payload = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "v1beta7.transaction.build_transfer",
+                "params": {
+                    "quote": quote,
+                    "source_address": {"blockchain": BLOCKCHAIN_ID, "address": wallet_hex},
+                    "destination_address": {"blockchain": BLOCKCHAIN_ID, "address": wallet_hex},
+                    "gas_excess_address": {"blockchain": BLOCKCHAIN_ID, "address": wallet_hex},
+                    "use_recommended_slippage": True,
+                },
+            }
+            await ws.send(json.dumps(payload))
+            all_raw = []
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=max(0.5, deadline - time.time()))
+                    data = json.loads(raw)
+                    all_raw.append(raw)
+                    if isinstance(data, dict):
+                        if data.get("error"):
+                            return {"error": f"build error: {str(data['error'])[:200]}", "raw": all_raw}
+                        res = data.get("result")
+                        if isinstance(res, dict):
+                            return {"tx": res, "raw": all_raw}
+                except asyncio.TimeoutError:
+                    break
+            return {"error": "no build result", "raw": all_raw}
+    except Exception as e:
+        return {"error": f"exception: {str(e)[:150]}"}
+
+async def test_quote():
+    lines = ["🧪 <b>اختبار 1: جلب Quote</b>", ""]
     q = await get_quote_via_events()
-
     if "error" in q:
-        lines.append(f"❌ {q['error'][:150]}")
-        raw = q.get("raw", [])
-        if raw:
-            lines.append("")
-            lines.append("📋 <b>آخر 3 ردود (كاملة):</b>")
-            for r in raw[-3:]:
-                safe = r.replace("<", "&lt;").replace(">", "&gt;")
-                if len(safe) > 800:
-                    safe = safe[:800] + "..."
-                lines.append(f"<code>{safe}</code>")
-        return "\n".join(lines)
-
-    quote = q.get("quote_event") or q.get("quote")
-    if not isinstance(quote, dict):
-        lines.append(f"⚠️ شكل غير معروف: {type(quote).__name__}")
-        lines.append(f"{str(quote)[:200]}")
-        return "\n".join(lines)
-
-    lines.append("✅ <b>استلمنا quote_updated!</b>")
-    lines.append(f"📊 الحقول: {list(quote.keys())}")
-
-    # نبحث عن ask_units
-    ask = quote.get("ask_units") or quote.get("ask_amount") or 0
+        lines.append(f"❌ {q['error'][:200]}")
+        return "\n".join(lines), None
+    quote = q["quote"]
+    ask = quote.get("ask_units", "0")
     try:
         ask_f = int(ask) / 1e9
-        lines.append(f"💰 الناتج: {ask_f:.4f} NOT")
     except Exception:
-        lines.append(f"💰 ask_units: {ask}")
-
-    # نحفظ الـ quote كامل للمرحلة الجاية
+        ask_f = 0
+    lines.append(f"✅ Quote نجح!")
+    lines.append(f"💰 0.1 TON → {ask_f:.4f} NOT")
+    lines.append(f"📊 quote_id: {quote.get('quote_id', '?')[:20]}...")
     lines.append("")
-    lines.append("🎯 <b>الخطوة الجاية:</b> نبني المعاملة من هذا الـ quote.")
-    lines.append("⏭️ قول: <b>جرب البناء</b>")
+    lines.append("🎯 الخطوة الجاية: اكتب <b>جرب البناء</b>")
+    return "\n".join(lines), quote
 
+async def test_build(quote):
+    lines = ["🧪 <b>اختبار 2: بناء المعاملة</b>", ""]
+    if not quote:
+        lines.append("❌ ماكو quote محفوظ. اكتب <b>اختبار</b> أول.")
+        return "\n".join(lines)
+    r = await build_transfer(quote)
+    if "error" in r:
+        lines.append(f"❌ {r['error'][:200]}")
+        raw = r.get("raw", [])
+        if raw:
+            lines.append("")
+            lines.append("📋 <b>آخر رد:</b>")
+            for x in raw[-2:]:
+                safe = x.replace("<", "&lt;").replace(">", "&gt;")
+                if len(safe) > 700:
+                    safe = safe[:700] + "..."
+                lines.append(f"<code>{safe}</code>")
+        return "\n".join(lines)
+    tx = r["tx"]
+    lines.append("✅ <b>Build نجح!</b>")
+    lines.append(f"📊 الحقول: {list(tx.keys())}")
+    lines.append("")
+    lines.append("🎯 قول لي: <b>هيك تمام</b> عشان نضيف التوقيع والإرسال.")
     return "\n".join(lines)
 
 # ═══════════════════════════════════════
 #   الحلقة الرئيسية
 # ═══════════════════════════════════════
-async def run_cycle(state):
+async def handle_messages(state):
     offset = state.get("last_update_id", 0) + 1
     updates = await get_updates(offset)
+    now = time.time()
     for u in updates:
         state["last_update_id"] = u["update_id"]
+        msg_date = u.get("message", {}).get("date", 0)
+        if now - msg_date > 120:
+            continue  # نتجاهل الرسائل الأقدم من دقيقتين
         text = (u.get("message", {}).get("text") or "").strip().lower()
+        if not text:
+            continue
+
         if "حالة" in text:
             await send(
-                f"📊 <b>حالة البوت</b>\n\n"
+                f"📊 <b>الحالة</b>\n"
                 f"🔍 الوضع: {state['phase']}\n"
-                f"💼 صفقات: {len(state['trades'])}"
+                f"💼 صفقات: {len(state['trades'])}\n"
+                f"🧪 آخر اختبار: {state.get('omni_test_result', 'ما تم')[:80]}"
             )
-        elif "اختبار" in text:
-            await send("🧪 جاري الاختبار...")
-            result = await test_omni_connection()
+        elif "اختبار" in text and "بناء" not in text:
+            await send("🧪 جاري جلب Quote...")
+            result, quote = await test_quote()
             state["omni_test_result"] = result[:200]
+            if quote:
+                state["last_quote"] = quote
             await send(result)
+        elif "بناء" in text or "جرب البناء" in text:
+            await send("🧪 جاري بناء المعاملة...")
+            result = await test_build(state.get("last_quote"))
+            await send(result)
+
+    return state
+
+async def run_cycle(state):
+    state = await handle_messages(state)
 
     if state["phase"] == "paused":
         return state
@@ -409,17 +384,12 @@ async def run_cycle(state):
         best = await scan(state)
         if best and best["score"] >= 65:
             reasons_txt = "\n".join(f"• {r}" for r in best["reasons"][:5])
-            mode_txt = "🧪 <b>وضع اختبار</b>" if DRY_RUN else "🔥 <b>وضع حقيقي</b>"
             await send(
-                f"🚨 <b>إشارة قوية!</b>\n{mode_txt}\n\n"
-                f"🪙 <b>{best['name']} ({best['symbol']})</b>\n"
+                f"🚨 <b>إشارة!</b> 🧪 وضع اختبار\n\n"
+                f"🪙 {best['name']} ({best['symbol']})\n"
                 f"💰 ${best['price']:.6f}\n"
-                f"📊 {best['score']:.0f}/100\n\n"
-                f"📝 <b>الأسباب:</b>\n{reasons_txt}"
+                f"📊 {best['score']:.0f}/100\n\n{reasons_txt}"
             )
-        else:
-            if best:
-                print(f"no signal ({best['symbol']}: {best['score']:.0f})")
 
     return state
 
@@ -427,14 +397,11 @@ async def main():
     state = load_state()
     await send(
         "🚀 <b>البوت شغال - وضع اختبار</b>\n\n"
-        "✍️ اكتب: <b>اختبار</b> لفحص Omniston"
+        "✍️ <b>اختبار</b> = جلب quote\n"
+        "✍️ <b>جرب البناء</b> = بناء المعاملة (بدون إرسال)\n"
+        "✍️ <b>حالة</b> = عرض الحالة"
     )
     print("bot started")
-
-    await send("🧪 جاري اختبار Omniston أول مرة...")
-    result = await test_omni_connection()
-    state["omni_test_result"] = result[:200]
-    await send(result)
 
     start = time.time()
     while time.time() - start < 5 * 3600 + 50 * 60:
