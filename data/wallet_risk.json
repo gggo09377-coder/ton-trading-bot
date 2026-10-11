@@ -1,0 +1,14 @@
+{
+  "wallet_address": "",
+  "manual_balance_usd": "6.00",
+  "use_manual_balance": true,
+  "trade_allocation_pct": "10",
+  "risk_per_trade_pct": "1",
+  "daily_loss_limit_pct": "3",
+  "reserve_ton": "0.35",
+  "paused": true,
+  "daily_start_balance_usd": "6.00",
+  "daily_loss_usd": "0",
+  "daily_date": "",
+  "last_balance_check": 0
+}
